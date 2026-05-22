@@ -1,0 +1,8 @@
+memoir.db
+archive/
+*.pyc
+__pycache__/
+*.db
+.env
+*.db-shm
+*.db-wal

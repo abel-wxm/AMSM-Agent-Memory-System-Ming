@@ -1,0 +1,12 @@
+auxiliary:
+  amsm:
+    provider: "custom:MY_PROVIDER"
+    timeout: 120
+
+custom_providers:
+  - name: "MY_PROVIDER"
+    base_url: "https://api.example.com/v1"
+    model: "my-model-name"
+    # Placeholder for API key, please replace with actual environment variable name or key
+    api_key_env: "YOUR_API_KEY_ENV_VAR"
+    api_key: "YOUR_API_KEY_PLACEHOLDER"
