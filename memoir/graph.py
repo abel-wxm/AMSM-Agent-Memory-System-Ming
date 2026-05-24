@@ -21,6 +21,15 @@ from memoir.config_params import MSD_SUMMARIZE_INTERVAL_FRAGMENTS, MSD_SUMMARIZE
 
 logger = logging.getLogger(__name__)
 
+def _extract_json_str(text: str) -> str:
+    text = text.strip()
+    s1, s2 = text.find('{'), text.find('[')
+    e1, e2 = text.rfind('}'), text.rfind(']')
+    start = min(x for x in (s1, s2) if x != -1) if (s1 != -1 or s2 != -1) else -1
+    end = max(e1, e2)
+    if start != -1 and end != -1 and end >= start:
+        return text[start:end+1]
+    return text
 
 def _call_llm_for_graph_extraction(
     summary: str,
@@ -48,7 +57,7 @@ def _call_llm_for_graph_extraction(
     data = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你是一个严谨的图谱提取引擎，仅输出JSON。"},
+            {"role": "system", "content": "你是一个严谨的图谱提取引擎。注意：你必须且只能输出纯净的 JSON 字符串文本，绝对不允许使用 ```json 等任何 Markdown 标记将其包裹，直接输出大括号开头的内容。"},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.1,
@@ -65,7 +74,7 @@ def _call_llm_for_graph_extraction(
             resp_body = response.read().decode("utf-8")
             resp_data = json.loads(resp_body)
             content = resp_data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            parsed = json.loads(_extract_json_str(content))
             with open("/home/abel/amsm_debug.log", "a") as f:
                 f.write(f"Graph extraction LLM response: {content}\n")
             return {
@@ -112,7 +121,7 @@ def _call_llm_for_conflict(
     data = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "仅输出JSON格式的检测结果。"},
+            {"role": "system", "content": "你是一个严谨的冲突检测引擎。注意：你必须且只能输出纯净的 JSON 字符串文本，绝对不允许使用 ```json 等任何 Markdown 标记将其包裹，直接输出大括号开头的内容。"},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.1,
@@ -129,7 +138,7 @@ def _call_llm_for_conflict(
             resp_body = response.read().decode("utf-8")
             resp_data = json.loads(resp_body)
             content = resp_data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            parsed = json.loads(_extract_json_str(content))
             return {"conflicts": parsed.get("conflicts", [])}
     except Exception as e:
         logger.error(f"冲突检测 LLM 请求失败: {e}")
@@ -333,7 +342,7 @@ def _call_llm_for_session_summarize(
     data = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你是一个高度概括的总结引擎，仅输出JSON。"},
+            {"role": "system", "content": "你是一个高度概括的总结引擎。注意：你必须且只能输出纯净的 JSON 字符串文本，绝对不允许使用 ```json 等任何 Markdown 标记将其包裹，直接输出大括号开头的内容。"},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.3,
@@ -350,7 +359,7 @@ def _call_llm_for_session_summarize(
             resp_body = response.read().decode("utf-8")
             resp_data = json.loads(resp_body)
             content = resp_data["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            parsed = json.loads(_extract_json_str(content))
             return {
                 "summary": parsed.get("summary", ""),
                 "keywords": parsed.get("keywords", [])

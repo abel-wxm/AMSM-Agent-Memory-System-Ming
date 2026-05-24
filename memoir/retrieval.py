@@ -14,7 +14,7 @@ import json
 import logging
 import sqlite3
 import time
-import json
+import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Set, Tuple
 
@@ -70,6 +70,22 @@ def _tokenize_query(query: str) -> List[str]:
             unique.append(token)
     return unique if unique else [query[:10]] if len(query) >= 2 else []
 
+def _extract_json_str(text: str) -> str:
+    """提取文本中的 JSON 部分，容错处理 Markdown 格式。"""
+    start = text.find('{')
+    if start == -1:
+        start = text.find('[')
+    if start == -1:
+        return text
+    
+    end_brace = text.rfind('}')
+    end_bracket = text.rfind(']')
+    end = max(end_brace, end_bracket)
+    
+    if end != -1 and end >= start:
+        return text[start:end+1]
+    return text
+
 def _call_llm_time_analysis(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
     base_url = config.get("base_url", "").rstrip("/")
     if not base_url:
@@ -100,6 +116,7 @@ def _call_llm_time_analysis(query: str, config: Dict[str, Any]) -> Dict[str, Any
         '  "radius_days": <置信半径天数，无时间概念时为0>,\n'
         '  "confidence": <0.0-1.0>\n'
         "}\n\n"
+        "注意：绝对不允许使用 ```json 等任何 Markdown 标记将其包裹，直接输出大括号开头的内容。\n"
         f"当前时间戳：{now_ts}\n"
         f"用户输入：{query}"
     )
@@ -107,7 +124,7 @@ def _call_llm_time_analysis(query: str, config: Dict[str, Any]) -> Dict[str, Any
     data = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "你只输出JSON，不说其他话。"},
+            {"role": "system", "content": "你只输出纯JSON格式，不说其他话。"},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.1,
@@ -124,6 +141,7 @@ def _call_llm_time_analysis(query: str, config: Dict[str, Any]) -> Dict[str, Any
             resp_body = response.read().decode("utf-8")
             resp_data = json.loads(resp_body)
             content = resp_data["choices"][0]["message"]["content"]
+            content = _extract_json_str(content)
             parsed = json.loads(content)
 
             has_time = parsed.get("has_time_concept", False)
@@ -228,8 +246,8 @@ def _build_candidates(query: str, query_keywords: List[str], session_id: str, is
             match_expr = " OR ".join(query_keywords)
             cursor.execute(
                 """
-                SELECT ff.fragment_id FROM fragments_fts ff
-                JOIN memory_fragments mf ON ff.fragment_id = mf.fragment_id
+                SELECT fragments_fts.fragment_id FROM fragments_fts
+                JOIN memory_fragments mf ON fragments_fts.fragment_id = mf.fragment_id
                 WHERE fragments_fts MATCH ?
                   AND (mf.session_id = ? OR mf.is_public = 1)
                 LIMIT 20
@@ -311,10 +329,57 @@ def _assess_confidence(
         
     return fragments[:20]
 
-def _load_fragments(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _call_llm_for_chain_summarize(query: str, chain_texts: List[str], config: Dict[str, Any]) -> str:
+    base_url = config.get("base_url", "").rstrip("/")
+    if not base_url:
+        return "\n".join(chain_texts)
+        
+    endpoint = f"{base_url}/chat/completions"
+    model = config.get("model", "")
+    api_key = config.get("api_key", "")
+    timeout = config.get("timeout", 120)
+    
+    chain_str = "\n".join([f"- {t}" for t in chain_texts])
+    prompt = (
+        "以下是一些按照时间变迁产生的事实链条记录：\n"
+        f"{chain_str}\n\n"
+        f"用户当前的检索词是：{query}\n\n"
+        "请帮我提炼出这些事实记录中，与用户检索词相关的事实变迁路线，合并成一段简练连贯的摘要。\n"
+        "要求：\n"
+        "1. 剔除无关的生活细节或游记等噪声。\n"
+        "2. 突出核心事实的转变过程（如职业、地点等）。\n"
+        "3. 直接输出摘要文本，不要包含多余寒暄。"
+    )
+    
+    data = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是一个精准的事实变迁提炼器，负责过滤噪声并总结客观事实。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+    }
+    
+    req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"))
+    req.add_header("Content-Type", "application/json")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+        
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            resp_body = response.read().decode("utf-8")
+            resp_data = json.loads(resp_body)
+            content = resp_data["choices"][0]["message"]["content"]
+            return content.strip()
+    except Exception as e:
+        logger.error(f"长链路提炼 LLM 请求失败: {e}")
+        return "\n".join(chain_texts)
+
+def _load_fragments(fragments: List[Dict[str, Any]], query: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """阶段四：决定加载深度（按排名加载 raw_text 或 summary），并处理图谱强制加载"""
     conn = get_connection()
     additional_fragments = {} # fragment_id -> fragment
+    global_visited_fids = {f["fragment_id"] for f in fragments}
     
     try:
         cursor = conn.cursor()
@@ -362,6 +427,8 @@ def _load_fragments(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 queue = deque([(start_node_id, 0)])
                 visited_nodes = {start_node_id}
                 
+                chain_frags = []
+                
                 while queue:
                     current_node_id, depth = queue.popleft()
                     
@@ -375,7 +442,7 @@ def _load_fragments(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         try:
                             t_ids = json.loads(curr_node["triggered_by_fragment_ids"])
                             for t_id in t_ids:
-                                if t_id not in additional_fragments and t_id != fid:
+                                if t_id not in additional_fragments and t_id != fid and t_id not in global_visited_fids:
                                     # 强制回表取
                                     cursor.execute(
                                         "SELECT * FROM memory_fragments WHERE fragment_id = ?",
@@ -388,7 +455,8 @@ def _load_fragments(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                                         t_frag["gc_deleted_at"] = t_frag.get("gc_deleted_at")
                                         t_frag["is_core"] = 1 # 强制标记以确保注入
                                         t_frag["_is_associated"] = True
-                                        additional_fragments[t_id] = t_frag
+                                        global_visited_fids.add(t_id)
+                                        chain_frags.append(t_frag)
                         except Exception as e:
                             logger.error(f"解析 triggered_by_fragment_ids 失败: {e}")
                     
@@ -427,7 +495,7 @@ def _load_fragments(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                                 nb_frag = cursor.fetchone()
                                 if nb_frag:
                                     n_fid = nb_frag["fragment_id"]
-                                    if n_fid not in additional_fragments and n_fid != fid:
+                                    if n_fid not in additional_fragments and n_fid != fid and n_fid not in global_visited_fids:
                                         cursor.execute(
                                             "SELECT * FROM memory_fragments WHERE fragment_id = ?",
                                             (n_fid,)
@@ -439,7 +507,26 @@ def _load_fragments(fragments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                                             n_frag["gc_deleted_at"] = n_frag.get("gc_deleted_at")
                                             n_frag["is_core"] = 1
                                             n_frag["_is_associated"] = True
-                                            additional_fragments[n_fid] = n_frag
+                                            global_visited_fids.add(n_fid)
+                                            chain_frags.append(n_frag)
+                                            
+                if len(chain_frags) > 3:
+                    raw_texts = [f["_loaded_raw_text"] for f in chain_frags if f["_loaded_raw_text"]]
+                    summary = _call_llm_for_chain_summarize(query, raw_texts, config)
+                    pseudo_fid = f"chain_summary_{fid}"
+                    pseudo_frag = {
+                        "fragment_id": pseudo_fid,
+                        "session_name": "系统链式提炼",
+                        "created_at": int(time.time()),
+                        "keywords": json.dumps(["事实变迁总结"]),
+                        "weight": 1.0,
+                        "_loaded_raw_text": summary,
+                        "_is_associated": True
+                    }
+                    additional_fragments[pseudo_fid] = pseudo_frag
+                else:
+                    for cf in chain_frags:
+                        additional_fragments[cf["fragment_id"]] = cf
                                             
         # 将 additional 插入结果
         # additional 会和原有 fragments 去重
@@ -568,7 +655,7 @@ def retrieve(query: str, session_id: str, config: Dict[str, Any]) -> str:
     fragments = _assess_confidence(fragments, query, query_keywords, session_id, time_info, max_weight)
     
     # 阶段四：决定加载深度
-    fragments = _load_fragments(fragments)
+    fragments = _load_fragments(fragments, query, config)
     
     # 七：注入格式化
     return _format_output(fragments)
