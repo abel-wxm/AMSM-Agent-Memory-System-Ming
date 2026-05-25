@@ -28,6 +28,10 @@ from memoir.config_params import (
     TOP_FULL_LOAD,
     GRAPH_TRAVERSE_MAX_DEPTH,
     GRAPH_TRAVERSE_MIN_AFFINITY,
+    INJECT_SUPPRESS_MSG_COUNT,
+    INJECT_SUPPRESS_CHARS,
+    FULL_SCAN_MAX_RETURN,
+    FULL_SCAN_MAX_CHARS,
 )
 
 logger = logging.getLogger(__name__)
@@ -170,28 +174,28 @@ def _call_llm_time_analysis(query: str, config: Dict[str, Any]) -> Dict[str, Any
             "confidence": 1.0,
         }
 
-def _preprocess(query: str, session_id: str, config: Dict[str, Any]) -> Tuple[Set[str], Dict[str, Any]]:
-    """阶段一：时间概念分析和 is_core 提取"""
+def _preprocess(query: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """阶段一：时间概念分析"""
+    return _call_llm_time_analysis(query, config)
+
+def _should_suppress(session_id: str) -> bool:
+    """检查是否处于静默期，抑制注入"""
     conn = get_connection()
-    core_ids = set()
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            SELECT fragment_id FROM memory_fragments
-            WHERE (session_id = ? OR is_public = 1) AND is_core = 1
-            """,
+            "SELECT COUNT(*), SUM(LENGTH(raw_text)) FROM memory_fragments WHERE session_id=?",
             (session_id,)
         )
-        for row in cursor.fetchall():
-            core_ids.add(row["fragment_id"])
+        row = cursor.fetchone()
+        count = row[0] if row and row[0] else 0
+        chars = row[1] if row and row[1] else 0
+        return count < INJECT_SUPPRESS_MSG_COUNT and chars < INJECT_SUPPRESS_CHARS
     except Exception as e:
-        logger.error(f"提取 is_core 失败: {e}")
+        logger.error(f"抑制检查失败: {e}")
+        return False
     finally:
         conn.close()
-
-    time_info = _call_llm_time_analysis(query, config)
-    return core_ids, time_info
 
 def _build_candidates(query: str, query_keywords: List[str], session_id: str, is_history_mode: bool) -> Set[str]:
     """阶段二：双路召回（图谱 + FTS5）"""
@@ -232,9 +236,9 @@ def _build_candidates(query: str, query_keywords: List[str], session_id: str, is
             cursor.execute(
                 f"""
                 SELECT gn.fragment_id FROM graph_nodes gn
-                JOIN memory_fragments mf ON gn.fragment_id = mf.fragment_id
+                JOIN public_library pl ON gn.fragment_id = pl.source_fragment_id
                 WHERE (gn.entity_name LIKE ? OR ? LIKE '%' || gn.entity_name || '%')
-                  AND mf.is_public = 1 AND gn.{status_clause}
+                  AND gn.{status_clause}
                 """,
                 (f"%{entity}%", entity),
             )
@@ -248,8 +252,9 @@ def _build_candidates(query: str, query_keywords: List[str], session_id: str, is
                 """
                 SELECT fragments_fts.fragment_id FROM fragments_fts
                 JOIN memory_fragments mf ON fragments_fts.fragment_id = mf.fragment_id
+                LEFT JOIN public_library pl ON fragments_fts.fragment_id = pl.source_fragment_id
                 WHERE fragments_fts MATCH ?
-                  AND (mf.session_id = ? OR mf.is_public = 1)
+                  AND (mf.session_id = ? OR pl.public_id IS NOT NULL)
                 LIMIT 20
                 """,
                 (match_expr, session_id),
@@ -273,14 +278,26 @@ def _fetch_lightweight_fields(candidate_ids: Set[str], is_history_mode: bool) ->
         placeholders = ",".join("?" for _ in candidate_ids)
         cursor.execute(
             f"""
-            SELECT fragment_id, session_id, created_at, keywords, summary,
-                   weight, is_core, is_manual, is_public
-            FROM memory_fragments WHERE fragment_id IN ({placeholders})
+            SELECT mf.fragment_id, mf.session_id, mf.created_at, mf.keywords, mf.summary, mf.weight,
+                   json_group_object(ft.tag_type, ft.tag_value) as tags_json
+            FROM memory_fragments mf
+            LEFT JOIN fragment_tags ft ON mf.fragment_id = ft.fragment_id
+            WHERE mf.fragment_id IN ({placeholders})
+            GROUP BY mf.fragment_id
             """,
             tuple(candidate_ids)
         )
         for row in cursor.fetchall():
             frag = dict(row)
+            tags_json = frag.pop('tags_json', '{}')
+            try:
+                parsed_tags = json.loads(tags_json) if tags_json else {}
+                # Remove null keys resulting from LEFT JOIN when there are no tags
+                parsed_tags = {k: v for k, v in parsed_tags.items() if k is not None}
+                frag['tags'] = parsed_tags
+            except:
+                frag['tags'] = {}
+                
             # 检查是否为 superseded
             cursor.execute(
                 "SELECT 1 FROM graph_nodes WHERE fragment_id = ? AND status = 'superseded'",
@@ -386,15 +403,10 @@ def _load_fragments(fragments: List[Dict[str, Any]], query: str, config: Dict[st
         non_core_count = 0
         for frag in fragments:
             fid = frag["fragment_id"]
-            is_core = frag.get("is_core", 0)
-            
             need_raw = False
-            if is_core == 1:
+            non_core_count += 1
+            if non_core_count <= TOP_FULL_LOAD:
                 need_raw = True
-            else:
-                non_core_count += 1
-                if non_core_count <= TOP_FULL_LOAD:
-                    need_raw = True
                     
             if need_raw:
                 cursor.execute(
@@ -453,7 +465,7 @@ def _load_fragments(fragments: List[Dict[str, Any]], query: str, config: Dict[st
                                         t_frag = dict(tf_row)
                                         t_frag["_loaded_raw_text"] = t_frag["raw_text"] if t_frag["raw_text"] else ""
                                         t_frag["gc_deleted_at"] = t_frag.get("gc_deleted_at")
-                                        t_frag["is_core"] = 1 # 强制标记以确保注入
+                                        t_frag["tags"] = {"core": "forced"} # 强制标记以确保注入
                                         t_frag["_is_associated"] = True
                                         global_visited_fids.add(t_id)
                                         chain_frags.append(t_frag)
@@ -505,7 +517,7 @@ def _load_fragments(fragments: List[Dict[str, Any]], query: str, config: Dict[st
                                             n_frag = dict(nf_row)
                                             n_frag["_loaded_raw_text"] = n_frag["raw_text"] if n_frag["raw_text"] else ""
                                             n_frag["gc_deleted_at"] = n_frag.get("gc_deleted_at")
-                                            n_frag["is_core"] = 1
+                                            n_frag["tags"] = {"core": "forced"}
                                             n_frag["_is_associated"] = True
                                             global_visited_fids.add(n_fid)
                                             chain_frags.append(n_frag)
@@ -552,7 +564,7 @@ def _format_output(fragments: List[Dict[str, Any]]) -> str:
     total_chars = 0
     max_chars = MAX_INJECT_CHARS
 
-    for frag in fragments:
+    for frag in fragments[:MAX_RETURN]:
         summary = frag.get("summary", "")
         keywords_raw = frag.get("keywords", "[]")
         try:
@@ -580,37 +592,82 @@ def _format_output(fragments: List[Dict[str, Any]]) -> str:
             continue
             
         raw_text = frag.get("_loaded_raw_text", "")
+        score = frag.get("score", 0)
         content = ""
-        remaining = max_chars - total_chars
+        label = ""
         
-        if raw_text:
-            if remaining > 0:
-                content = raw_text[:remaining]
-                total_chars += len(content)
-            else:
-                content = summary
-                total_chars += len(summary)
-        elif summary:
+        if score >= THRESHOLD_HIGH:
+            content = raw_text if raw_text else summary
+        else:
             content = summary
-            total_chars += len(summary)
+            label = " 【摘要，可请求全文】"
 
-        lines.append(content)
-        lines.append(f"> 💡 来源: {session_name} | 时间: {date_str} | 标签: {tag_str} | 权重: {weight}")
-
+        entry = f"{content}{label}\n> 💡 来源: {session_name} | 时间: {date_str} | 标签: {tag_str} | 权重: {weight}"
+        
         if frag.get("_is_superseded"):
             sup_at = frag.get("superseded_at", 0)
             sup_at_str = time.strftime("%Y-%m-%d", time.localtime(sup_at)) if sup_at else "未知"
             sup_reason = frag.get("superseded_reason", "已被新信息替代")
-            lines.append(f"> ⚠️ 此信息已于 {sup_at_str} 过时：{sup_reason}")
-
+            entry += f"\n> ⚠️ 此信息已于 {sup_at_str} 过时：{sup_reason}"
+            
+        entry_len = len(entry)
+        if total_chars + entry_len > max_chars:
+            lines.append("【注意：已触发注入字符限额，更多记忆未展示】")
+            break
+            
+        lines.append(entry)
         lines.append("")
+        total_chars += entry_len
 
     return "\n".join(lines).strip()
 
+def full_scan_search(query_terms: List[str], session_id: str) -> str:
+    """全库FTS5扫描，绕开抑制和图谱，直接匹配原词"""
+    if not query_terms:
+        return ""
+        
+    conn = get_connection()
+    fragments = []
+    try:
+        cursor = conn.cursor()
+        match_expr = " OR ".join(query_terms)
+        cursor.execute(
+            """
+            SELECT mf.fragment_id, mf.session_id, mf.created_at, mf.keywords, mf.summary, mf.raw_text, mf.weight
+            FROM fragments_fts fts
+            JOIN memory_fragments mf ON fts.fragment_id = mf.fragment_id
+            LEFT JOIN public_library pl ON fts.fragment_id = pl.source_fragment_id
+            WHERE fts.fragments_fts MATCH ?
+              AND (mf.session_id = ? OR pl.public_id IS NOT NULL)
+            LIMIT ?
+            """,
+            (match_expr, session_id, FULL_SCAN_MAX_RETURN)
+        )
+        for row in cursor.fetchall():
+            frag = dict(row)
+            frag["score"] = 1.0 # 强制给高分，确保全文输出
+            frag["_loaded_raw_text"] = frag["raw_text"]
+            fragments.append(frag)
+    except Exception as e:
+        logger.error(f"FTS全库扫描失败: {e}")
+    finally:
+        conn.close()
+        
+    # 重用 _format_output，临时放大限额
+    global MAX_INJECT_CHARS
+    old_max = MAX_INJECT_CHARS
+    MAX_INJECT_CHARS = FULL_SCAN_MAX_CHARS
+    out = _format_output(fragments)
+    MAX_INJECT_CHARS = old_max
+    return out
+
 def retrieve(query: str, session_id: str, config: Dict[str, Any]) -> str:
     """主入口，执行五阶段流程"""
-    # 阶段一：预处理
-    core_ids, time_info = _preprocess(query, session_id, config)
+    # 阶段一：预处理，增加抑制检查
+    if _should_suppress(session_id):
+        return ""
+        
+    time_info = _preprocess(query, config)
     if time_info.get("confidence", 1.0) < 0.6:
         return "⏳ 您提到的时间有些模糊，请确认一下您指的是大约什么时候？"
         
@@ -618,7 +675,6 @@ def retrieve(query: str, session_id: str, config: Dict[str, Any]) -> str:
     
     # 阶段二：双路召回（图谱 + FTS5）
     candidate_ids = _build_candidates(query, query_keywords, session_id, time_info.get("is_history_mode", False))
-    candidate_ids.update(core_ids)
     
     if not candidate_ids:
         cross_fragments = _assess_confidence([], query, query_keywords, session_id, time_info, 1.0)

@@ -121,13 +121,21 @@ def mark_core(
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        now = int(time.time())
         cursor.execute(
             """
-            UPDATE memory_fragments
-            SET is_core = 1, core_reason = ?
-            WHERE fragment_id = ?
+            INSERT INTO fragment_tags (fragment_id, tag_type, tag_value, created_at)
+            VALUES (?, 'core', '1', ?)
             """,
-            (core_reason, fragment_id),
+            (fragment_id, now),
+        )
+        # 记录 core_reason
+        cursor.execute(
+            """
+            INSERT INTO fragment_tags (fragment_id, tag_type, tag_value, created_at)
+            VALUES (?, 'core_reason', ?, ?)
+            """,
+            (fragment_id, core_reason, now),
         )
         conn.commit()
     finally:
