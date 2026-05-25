@@ -4,10 +4,31 @@ AMSM 系统参数配置表 (SPEC V6.2 §五C)
 """
 
 # ── 检索参数 ──────────────────────────────────────────
-THRESHOLD_LOW        = 0.40  # 可信度低阈值，低于此分触发跨会话检索
-THRESHOLD_HIGH       = 0.70  # 可信度高阈值，高于此分直接输出
-MAX_RETURN           = 20    # 检索最大返回条数
-MAX_INJECT_CHARS     = 500   # 注入上下文最大字数
+THRESHOLD_LOW        = 0.40  # 可信度低阈值，低于此分触发跨会话检索（注：满分为1.0归一化绝对值；公式变更时需重新校准阈值）
+THRESHOLD_HIGH       = 0.70  # 可信度高阈值，高于此分才允许下发全文，否则一律下发摘要（注：满分为1.0）
+
+# 注入控制
+MAX_RETURN           = 10    # 检索最大返回条数
+MAX_INJECT_CHARS     = 350   # 常规静默注入的上下文最大字符数
+MAX_SECONDARY_INJECT_CHARS = 1000 # 二次精准请求加载全文时的放宽字数限额
+INJECT_SUPPRESS_MSG_COUNT = 20 # 注入抑制阈值：前 20 条不注入
+INJECT_SUPPRESS_CHARS = 500    # 注入抑制阈值：前 500 字不注入
+
+# 上下文熔断（暂保留参数，逻辑暂不实现）
+# CONTEXT_WINDOW_THRESHOLD = 0.80
+
+# 全库扫描模式（用户主动触发）
+FULL_SCAN_MAX_RETURN = 20
+FULL_SCAN_MAX_CHARS = 1000
+
+# 原子化提取
+PUBLIC_ATOMIC_MODE = "async"         # sync / async
+PUBLIC_ATOMIC_INTERVAL_DAYS = 3
+PUBLIC_ATOMIC_INTERVAL_FRAGS = 10
+
+# 身份事实评分乘数
+IDENTITY_FACT_SCORE_MULTIPLIER = 1.5
+
 TOP_FULL_LOAD        = 5     # 排名前N条同时加载raw_text，其余只加summary
 
 # ── 评分权重（当前会话片段级）────────────────────────

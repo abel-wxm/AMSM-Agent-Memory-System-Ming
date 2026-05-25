@@ -11,6 +11,9 @@ from memoir.config_params import (
     W_MSD_TIME_FIRST_K,
     W_MSD_KEYWORD_T,
     W_MSD_KEYWORD_K,
+    W_PUBLIC_MEMORY,
+    W_USER_MARK,
+    IDENTITY_FACT_SCORE_MULTIPLIER,
 )
 
 def _calc_t_score(d_days: float, r_days: float) -> float:
@@ -48,11 +51,15 @@ def _calc_w_score(weight: float, max_weight: float) -> float:
         weight = 0.0
     return math.log(weight + 1) / math.log(max_weight_clamped + 1)
 
-def _calc_c_score(is_core: int) -> float:
+def _calc_c_score(tags: Dict[str, str]) -> float:
     """
-    is_core: 1 if it is a core fragment, 0 otherwise
+    根据信誉度评估计算 C_score
     """
-    return 1.0 if is_core == 1 else 0.0
+    if tags.get("favorite") == "1":
+        return 1.0
+    if tags.get("archive_type") == "user_specified":
+        return 0.6
+    return 0.3
 
 def _count_hits(text: str, query_terms: List[str]) -> int:
     if not text or not query_terms:
@@ -115,16 +122,18 @@ def score_fragments(
         weight = frag.get('weight', 1.0)
         w_score = _calc_w_score(weight, max_weight)
 
-        # Core Score
-        is_core = frag.get('is_core', 0)
-        c_score = _calc_c_score(is_core)
+        # Credibility Score
+        tags = frag.get('tags', {})
+        c_score = _calc_c_score(tags)
 
         # Combined Base Score
-        base_score = (t_score * t_weight) + (k_score * k_weight) + (w_score * 0.10) + (c_score * 0.10)
+        base_score = (t_score * t_weight) + (k_score * k_weight) + (w_score * W_USER_MARK) + (c_score * W_PUBLIC_MEMORY)
 
-        # Manual Adjustment
-        is_manual = frag.get('is_manual', 0)
-        final_score = base_score * 2.0 if is_manual == 1 else base_score
+        # 信用乘数提权 (Identity Fact Boost)
+        if tags.get("identity_fact") == "1":
+            final_score = base_score * IDENTITY_FACT_SCORE_MULTIPLIER
+        else:
+            final_score = base_score
 
         # Cross Session Factor
         session_factor = frag.get('session_factor', 1.0)

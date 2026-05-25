@@ -22,16 +22,7 @@ CREATE TABLE IF NOT EXISTS memory_fragments (
     keywords             TEXT,
     raw_text             TEXT,
     weight               REAL DEFAULT 1.0,
-    is_manual            INTEGER DEFAULT 0,
-    is_core              INTEGER DEFAULT 0,
-    core_reason          TEXT,
-    is_public            INTEGER DEFAULT 0,
-    is_favorite          INTEGER DEFAULT 0,
-    archive_type         TEXT,
-    channel              TEXT,
     source_msg_ids       TEXT,
-    public_source_path   TEXT,
-    modified_log         TEXT,
     last_accessed_at     INTEGER NOT NULL,
     gc_deleted_at        INTEGER,
     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
@@ -156,6 +147,32 @@ CREATE TABLE IF NOT EXISTS evolution_samples (
 );
 """
 
+# -- 10. fragment_tags --------------------------------------------------
+SQL_CREATE_FRAGMENT_TAGS = """
+CREATE TABLE IF NOT EXISTS fragment_tags (
+    fragment_id   TEXT NOT NULL,
+    tag_type      TEXT NOT NULL,
+    tag_value     TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    FOREIGN KEY(fragment_id) REFERENCES memory_fragments(fragment_id) ON DELETE CASCADE
+);
+"""
+
+# -- 11. public_library -------------------------------------------------
+SQL_CREATE_PUBLIC_LIBRARY = """
+CREATE TABLE IF NOT EXISTS public_library (
+    public_id           TEXT PRIMARY KEY,
+    source_fragment_id  TEXT,
+    raw_text            TEXT,
+    summary             TEXT,
+    keywords            TEXT,
+    added_by            TEXT,
+    created_at          INTEGER NOT NULL,
+    is_atomic           INTEGER DEFAULT 0,
+    similar_to          TEXT DEFAULT '[]'
+);
+"""
+
 # -- 全部建表语句列表（供 init_db 使用）---------------------------------
 ALL_CREATE_STATEMENTS = [
     SQL_CREATE_SESSIONS,
@@ -167,4 +184,6 @@ ALL_CREATE_STATEMENTS = [
     SQL_CREATE_GLOBAL_GRAPH_INDEX,
     SQL_CREATE_FRAGMENTS_FTS,
     SQL_CREATE_EVOLUTION_SAMPLES,
+    SQL_CREATE_FRAGMENT_TAGS,
+    SQL_CREATE_PUBLIC_LIBRARY,
 ]

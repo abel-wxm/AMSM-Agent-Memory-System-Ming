@@ -51,9 +51,9 @@ def run_gc() -> Dict[str, List[str]]:
         # Phase 1: Identify targets
         cursor.execute(
             """
-            SELECT m.fragment_id, m.weight, m.created_at, m.last_accessed_at, m.is_core, m.is_public,
-                   g.status, m.session_id, m.summary, m.keywords, m.raw_text, m.is_manual,
-                   m.is_favorite, m.archive_type, m.channel, m.source_msg_ids, m.public_source_path, m.modified_log
+            SELECT m.fragment_id, m.weight, m.created_at, m.last_accessed_at,
+                   g.status, m.session_id, m.summary, m.keywords, m.raw_text,
+                   (SELECT 1 FROM fragment_tags t WHERE t.fragment_id = m.fragment_id AND t.tag_type = 'core' LIMIT 1) as is_core
             FROM memory_fragments m
             LEFT JOIN graph_nodes g ON m.fragment_id = g.fragment_id
             WHERE m.weight <= ?
@@ -75,7 +75,7 @@ def run_gc() -> Dict[str, List[str]]:
             
             threshold = GC_BASE_DAYS * weight * 86400
             if (now - row["created_at"]) > threshold and (now - row["last_accessed_at"]) > threshold:
-                if row["is_core"] == 1 or row["is_public"] == 1 or row["status"] == "superseded":
+                if row["is_core"] == 1 or row["status"] == "superseded":
                     skipped.append(fid)
                     continue
                     
@@ -97,9 +97,10 @@ def run_gc() -> Dict[str, List[str]]:
         # Phase 2: Identify targets
         cursor.execute(
             """
-            SELECT node_id, fragment_id, session_id, gc_pending_since
-            FROM graph_nodes
-            WHERE gc_pending = 1
+            SELECT n.node_id, n.fragment_id, n.session_id, n.gc_pending_since,
+                   (SELECT 1 FROM public_library pl WHERE pl.source_fragment_id = n.fragment_id LIMIT 1) as is_public
+            FROM graph_nodes n
+            WHERE n.gc_pending = 1
             """
         )
         p2_candidates = cursor.fetchall()
@@ -107,6 +108,9 @@ def run_gc() -> Dict[str, List[str]]:
         
         for row in p2_candidates:
             if (now - row["gc_pending_since"]) > GC_PHASE2_DAYS * 86400:
+                if row["is_public"] == 1:
+                    continue  # 绝对拦截 Phase 2，保护公共记忆的溯源锚点
+                    
                 nid = row["node_id"]
                 fid = row["fragment_id"]
                 sid = row["session_id"]
@@ -114,6 +118,7 @@ def run_gc() -> Dict[str, List[str]]:
                 cursor.execute("DELETE FROM graph_edges WHERE from_node_id = ? OR to_node_id = ?", (nid, nid))
                 cursor.execute("DELETE FROM graph_nodes WHERE node_id = ?", (nid,))
                 cursor.execute("DELETE FROM memory_fragments WHERE fragment_id = ?", (fid,))
+                cursor.execute("DELETE FROM fragment_tags WHERE fragment_id = ?", (fid,))
                 
                 phase2_removed.append(nid)
                 affected_sessions.add(sid)
